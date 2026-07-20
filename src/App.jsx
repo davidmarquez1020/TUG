@@ -1,10 +1,15 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
-import { saveJob, loadJob, loadAllJobs } from "./lib/storage.js";
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  loadJob, loadAllJobs, createJob, acceptJob, advanceJobStatus, cancelJob,
+  subscribeToJob, subscribeToJobsBoard,
+} from "./lib/storage.js";
+import { onAuthStateChange, getProfile, updateProfile, signOut } from "./lib/auth.js";
+import AuthGate from "./components/AuthGate.jsx";
 import {
   MapPin, Truck, LifeBuoy, Battery, Droplets, Mountain, Radio, Compass,
   Star, Phone, MessageCircle, CheckCircle2, Clock, Fuel, Wind,
   TriangleAlert, ChevronRight, Power, DollarSign, Bike, CircleDot,
-  ArrowRight, Users, ShieldCheck, Zap, Car, Wrench
+  ArrowRight, Users, ShieldCheck, Zap, Car, Wrench, LogOut
 } from "lucide-react";
 
 // ---------- reference data ----------
@@ -37,13 +42,6 @@ const STATUS_LABEL = {
   recovering: "Recovering",
   complete: "Complete",
 };
-const OPERATOR_POOL = [
-  { name: "J. Alvarado", rig: "Ram 2500 w/ 12k winch" },
-  { name: "Wasatch Trail Rescue", rig: "Jeep JK, dual winch" },
-  { name: "K. Meadows", rig: "Toyota Tacoma, PIAK bar" },
-  { name: "Metro Roadside Co.", rig: "Flatbed w/ jump pack + spares" },
-];
-
 function sit(id) {
   return SITUATIONS.find((s) => s.id === id);
 }
@@ -222,13 +220,13 @@ function Landing({ onStranded, onOps }) {
 
 // ---------- Stranded: form + status ----------
 
-function StrandedForm({ onCreated, onCancel }) {
+function StrandedForm({ userId, profile, onCreated, onCancel }) {
   const [vehicle, setVehicle] = useState(null);
   const [situation, setSituation] = useState(null);
   const [equipment, setEquipment] = useState([]);
   const [notes, setNotes] = useState("");
-  const [name, setName] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
 
   function toggleEquip(item) {
     setEquipment((e) => (e.includes(item) ? e.filter((x) => x !== item) : [...e, item]));
@@ -237,24 +235,24 @@ function StrandedForm({ onCreated, onCancel }) {
   async function submit() {
     if (!vehicle || !situation) return;
     setSubmitting(true);
+    setError("");
     const s = sit(situation);
-    const job = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      requester: name.trim() || "Anonymous driver",
-      vehicle,
-      situation,
-      equipment,
-      notes: notes.trim(),
-      coords: randCoord(),
-      distance: +(2 + Math.random() * 6).toFixed(1),
-      payout: s.payout,
-      status: "open",
-      assignedUnit: null,
-      createdAt: Date.now(),
-    };
-    await saveJob(job);
-    setSubmitting(false);
-    onCreated(job.id);
+    try {
+      const job = await createJob(userId, {
+        vehicle,
+        situation,
+        equipment,
+        notes: notes.trim(),
+        coords: randCoord(), // placeholder until real geolocation is wired in
+        distance: +(2 + Math.random() * 6).toFixed(1),
+        payout: s.payout,
+      });
+      onCreated(job.id);
+    } catch (err) {
+      setError(err.message || "Couldn't post that request. Try again.");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   const canSubmit = vehicle && situation;
@@ -265,19 +263,12 @@ function StrandedForm({ onCreated, onCancel }) {
         <ChevronRight className="w-3.5 h-3.5 rotate-180" /> Back
       </button>
       <h2 className="text-gray-50 font-semibold text-xl mb-1">Report your situation</h2>
-      <p className="text-gray-400 text-sm mb-6">This posts to the live board — any online recovery unit can see and accept it.</p>
+      <p className="text-gray-400 text-sm mb-6">
+        Posting as <span className="text-gray-200">{profile?.display_name}</span> — this goes to the live board,
+        any online recovery unit can see and accept it.
+      </p>
 
       <div className="space-y-6">
-        <div>
-          <label className="text-gray-400 text-xs font-medium mb-2 block uppercase tracking-wide">Your name</label>
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="First name or handle"
-            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-gray-100 placeholder-gray-500"
-          />
-        </div>
-
         <div>
           <p className="text-gray-400 text-xs font-medium mb-2 uppercase tracking-wide">Vehicle type</p>
           <div className="grid grid-cols-2 gap-2">
@@ -345,6 +336,8 @@ function StrandedForm({ onCreated, onCancel }) {
           />
         </div>
 
+        {error && <p className="text-orange-400 text-xs">{error}</p>}
+
         <Button tone="orange" disabled={!canSubmit || submitting} onClick={submit} className="w-full">
           {submitting ? "POSTING..." : "BROADCAST REQUEST"}
         </Button>
@@ -355,32 +348,26 @@ function StrandedForm({ onCreated, onCancel }) {
 
 function StrandedStatus({ jobId, onDone, onCancel }) {
   const [job, setJob] = useState(null);
-  const botFired = useRef(false);
 
-  const poll = useCallback(async () => {
+  const refresh = useCallback(async () => {
     const j = await loadJob(jobId);
     if (j) setJob(j);
   }, [jobId]);
 
   useEffect(() => {
-    poll();
-    const t = setInterval(poll, 2200);
-    return () => clearInterval(t);
-  }, [poll]);
+    refresh();
+    const unsubscribe = subscribeToJob(jobId, refresh);
+    return unsubscribe;
+  }, [jobId, refresh]);
 
-  // demo fallback: if nobody on the ops board accepts within 9s, auto-assign a unit
-  useEffect(() => {
-    const t = setTimeout(async () => {
-      if (botFired.current) return;
-      const current = await loadJob(jobId);
-      if (current && current.status === "open") {
-        botFired.current = true;
-        const unit = OPERATOR_POOL[Math.floor(Math.random() * OPERATOR_POOL.length)];
-        await saveJob({ ...current, status: "accepted", assignedUnit: unit });
-      }
-    }, 9000);
-    return () => clearTimeout(t);
-  }, [jobId]);
+  async function handleCancel() {
+    try {
+      await cancelJob(jobId);
+    } catch (err) {
+      console.error(err);
+    }
+    onCancel();
+  }
 
   if (!job) {
     return <div className="max-w-lg mx-auto px-6 py-10 text-gray-400 text-sm">Loading request...</div>;
@@ -394,9 +381,9 @@ function StrandedStatus({ jobId, onDone, onCancel }) {
           <Radio className="w-8 h-8 text-orange-600 relative" />
         </div>
         <p className="text-gray-100 font-medium text-sm">Broadcasting to nearby units...</p>
-        <p className="text-gray-400 text-xs">Open the ops board in another tab to accept this job live.</p>
+        <p className="text-gray-400 text-xs">Open the ops board in another tab or account to accept this job live.</p>
         <Coord>{job.coords}</Coord>
-        <button onClick={onCancel} className="text-gray-400 text-xs underline underline-offset-2 mt-2">Cancel request</button>
+        <button onClick={handleCancel} className="text-gray-400 text-xs underline underline-offset-2 mt-2">Cancel request</button>
       </div>
     );
   }
@@ -442,28 +429,74 @@ function StrandedStatus({ jobId, onDone, onCancel }) {
 
 // ---------- Ops: board + job ----------
 
-function OpsBoard({ operator, onAccept, myJobId }) {
+function OpsBoard({ userId, profile, onProfileUpdate, onAccept }) {
   const [jobs, setJobs] = useState([]);
   const [online, setOnline] = useState(true);
+  const [rigInput, setRigInput] = useState("");
+  const [savingRig, setSavingRig] = useState(false);
+  const [acceptError, setAcceptError] = useState("");
 
-  const poll = useCallback(async () => {
+  const refresh = useCallback(async () => {
     const all = await loadAllJobs();
     setJobs(all);
   }, []);
 
   useEffect(() => {
-    poll();
-    const t = setInterval(poll, 2500);
-    return () => clearInterval(t);
-  }, [poll]);
+    refresh();
+    const unsubscribe = subscribeToJobsBoard(refresh);
+    return unsubscribe;
+  }, [refresh]);
 
   const open = jobs.filter((j) => j.status === "open");
-  const mine = jobs.filter((j) => j.assignedUnit && j.assignedUnit.name === operator.name && j.status !== "complete");
+  const mine = jobs.filter((j) => j.assignedOperatorId === userId && j.status !== "complete");
+
+  async function saveRig() {
+    if (!rigInput.trim()) return;
+    setSavingRig(true);
+    try {
+      await updateProfile(userId, { rig: rigInput.trim(), role: "operator" });
+      onProfileUpdate();
+    } finally {
+      setSavingRig(false);
+    }
+  }
 
   async function accept(job) {
-    const updated = { ...job, status: "accepted", assignedUnit: operator };
-    await saveJob(updated);
-    onAccept(job.id);
+    setAcceptError("");
+    try {
+      await acceptJob(job.id, userId);
+      onAccept(job.id);
+    } catch (err) {
+      setAcceptError(
+        err.message?.includes("row-level security") || err.code === "42501"
+          ? "Your account isn't verified as a recovery operator yet."
+          : err.message || "Couldn't accept that job — someone may have just taken it."
+      );
+    }
+  }
+
+  // no rig on file yet — treat this as "not set up as an operator"
+  if (!profile?.rig) {
+    return (
+      <div className="max-w-lg mx-auto px-6 py-10">
+        <h2 className="text-gray-50 font-semibold text-xl mb-1">Set up your recovery unit</h2>
+        <p className="text-gray-400 text-sm mb-6">
+          Tell requesters what you're driving so they know what kind of recovery you can do.
+        </p>
+        <div className="bg-gray-800 border border-gray-700 rounded-xl p-4 space-y-3">
+          <label className="text-gray-400 text-xs font-medium block uppercase tracking-wide">Your rig</label>
+          <input
+            value={rigInput}
+            onChange={(e) => setRigInput(e.target.value)}
+            placeholder="e.g. Ram 2500 w/ 12k winch"
+            className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-gray-100 placeholder-gray-500"
+          />
+          <Button tone="emerald" onClick={saveRig} disabled={savingRig || !rigInput.trim()} className="w-full">
+            {savingRig ? "SAVING..." : "SAVE AND CONTINUE"}
+          </Button>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -471,7 +504,7 @@ function OpsBoard({ operator, onAccept, myJobId }) {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h2 className="text-gray-50 font-semibold text-xl">Recovery board</h2>
-          <p className="text-gray-400 text-sm">Signed in as <span className="text-gray-200">{operator.name}</span> &middot; {operator.rig}</p>
+          <p className="text-gray-400 text-sm">Signed in as <span className="text-gray-200">{profile.display_name}</span> &middot; {profile.rig}</p>
         </div>
         <button
           onClick={() => setOnline((o) => !o)}
@@ -480,6 +513,22 @@ function OpsBoard({ operator, onAccept, myJobId }) {
           <Power className="w-3.5 h-3.5" /> {online ? "Online" : "Offline"}
         </button>
       </div>
+
+      {!profile.is_verified && (
+        <div className="bg-orange-950 border border-orange-800 rounded-xl p-4 mb-6 flex items-start gap-3">
+          <ShieldCheck className="w-4 h-4 text-orange-400 mt-0.5 shrink-0" />
+          <p className="text-orange-400 text-sm">
+            Your account is pending verification. You can browse the board, but you won't be able to accept jobs
+            until an admin verifies your account.
+          </p>
+        </div>
+      )}
+
+      {acceptError && (
+        <div className="bg-orange-950 border border-orange-800 rounded-xl p-3 mb-6">
+          <p className="text-orange-400 text-sm">{acceptError}</p>
+        </div>
+      )}
 
       {mine.length > 0 && (
         <div className="mb-8">
@@ -537,7 +586,15 @@ function OpsBoard({ operator, onAccept, myJobId }) {
                     <Coord>{j.coords}</Coord>
                     <span>{j.distance} mi away</span>
                   </div>
-                  <Button tone="emerald" size="sm" onClick={() => accept(j)} className="w-full mt-1">Accept job</Button>
+                  <Button
+                    tone="emerald"
+                    size="sm"
+                    onClick={() => accept(j)}
+                    disabled={!profile.is_verified}
+                    className="w-full mt-1"
+                  >
+                    Accept job
+                  </Button>
                 </div>
               );
             })}
@@ -550,25 +607,30 @@ function OpsBoard({ operator, onAccept, myJobId }) {
 
 function OpsJob({ jobId, onExit }) {
   const [job, setJob] = useState(null);
+  const [advancing, setAdvancing] = useState(false);
 
-  const poll = useCallback(async () => {
+  const refresh = useCallback(async () => {
     const j = await loadJob(jobId);
     if (j) setJob(j);
   }, [jobId]);
 
   useEffect(() => {
-    poll();
-    const t = setInterval(poll, 2500);
-    return () => clearInterval(t);
-  }, [poll]);
+    refresh();
+    const unsubscribe = subscribeToJob(jobId, refresh);
+    return unsubscribe;
+  }, [jobId, refresh]);
 
   async function advance() {
     if (!job) return;
     const idx = STATUS_STEPS.indexOf(job.status);
     const next = STATUS_STEPS[Math.min(idx + 1, STATUS_STEPS.length - 1)];
-    const updated = { ...job, status: next };
-    await saveJob(updated);
-    setJob(updated);
+    setAdvancing(true);
+    try {
+      const updated = await advanceJobStatus(job.id, next);
+      setJob(updated);
+    } finally {
+      setAdvancing(false);
+    }
   }
 
   if (!job) return <div className="max-w-lg mx-auto px-6 py-10 text-gray-400 text-sm">Loading job...</div>;
@@ -603,7 +665,9 @@ function OpsJob({ jobId, onExit }) {
         {done ? (
           <Button tone="stone" disabled className="w-full">JOB COMPLETE</Button>
         ) : (
-          <Button tone="emerald" onClick={advance} className="w-full">MARK: {nextLabel?.toUpperCase()}</Button>
+          <Button tone="emerald" onClick={advance} disabled={advancing} className="w-full">
+            {advancing ? "UPDATING..." : `MARK: ${nextLabel?.toUpperCase()}`}
+          </Button>
         )}
       </div>
     </div>
@@ -613,12 +677,40 @@ function OpsJob({ jobId, onExit }) {
 // ---------- app shell ----------
 
 export default function App() {
+  const [session, setSession] = useState(undefined); // undefined = still checking, null = signed out
+  const [profile, setProfile] = useState(null);
   const [view, setView] = useState("landing"); // landing | stranded-form | stranded-status | ops-board | ops-job
   const [myJobId, setMyJobId] = useState(null);
   const [opsJobId, setOpsJobId] = useState(null);
-  const [operator] = useState(() => OPERATOR_POOL[Math.floor(Math.random() * OPERATOR_POOL.length)]);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChange((s) => setSession(s));
+    return unsubscribe;
+  }, []);
+
+  const refreshProfile = useCallback(async () => {
+    if (session?.user) setProfile(await getProfile(session.user.id));
+  }, [session]);
+
+  useEffect(() => {
+    if (session?.user) refreshProfile();
+    else setProfile(null);
+  }, [session, refreshProfile]);
+
+  if (session === undefined) {
+    return <div className="min-h-screen bg-gray-950 flex items-center justify-center text-gray-500 text-sm">Loading...</div>;
+  }
+
+  if (!session) {
+    return <AuthGate />;
+  }
+
+  if (!profile) {
+    return <div className="min-h-screen bg-gray-950 flex items-center justify-center text-gray-500 text-sm">Setting up your account...</div>;
+  }
 
   const showNav = view !== "landing";
+  const userId = session.user.id;
 
   return (
     <div className="min-h-screen bg-gray-950 relative">
@@ -630,18 +722,23 @@ export default function App() {
             <button onClick={() => setView("landing")} className="flex items-center gap-2 text-gray-200 font-semibold text-sm">
               <Zap className="w-4 h-4 text-orange-600" /> TUG
             </button>
-            <div className="flex bg-gray-800 border border-gray-700 rounded-full p-1">
-              <button
-                onClick={() => setView(myJobId ? "stranded-status" : "stranded-form")}
-                className={`px-4 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 ${view.startsWith("stranded") ? "bg-orange-600 text-white" : "text-gray-400"}`}
-              >
-                <LifeBuoy className="w-3.5 h-3.5" /> STRANDED
-              </button>
-              <button
-                onClick={() => setView("ops-board")}
-                className={`px-4 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 ${view.startsWith("ops") ? "bg-emerald-600 text-white" : "text-gray-400"}`}
-              >
-                <Truck className="w-3.5 h-3.5" /> RECOVERY UNIT
+            <div className="flex items-center gap-3">
+              <div className="flex bg-gray-800 border border-gray-700 rounded-full p-1">
+                <button
+                  onClick={() => setView(myJobId ? "stranded-status" : "stranded-form")}
+                  className={`px-4 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 ${view.startsWith("stranded") ? "bg-orange-600 text-white" : "text-gray-400"}`}
+                >
+                  <LifeBuoy className="w-3.5 h-3.5" /> STRANDED
+                </button>
+                <button
+                  onClick={() => setView("ops-board")}
+                  className={`px-4 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 ${view.startsWith("ops") ? "bg-emerald-600 text-white" : "text-gray-400"}`}
+                >
+                  <Truck className="w-3.5 h-3.5" /> RECOVERY UNIT
+                </button>
+              </div>
+              <button onClick={() => signOut()} className="text-gray-500 hover:text-gray-300" aria-label="Sign out">
+                <LogOut className="w-4 h-4" />
               </button>
             </div>
           </div>
@@ -652,6 +749,8 @@ export default function App() {
 
       {view === "stranded-form" && (
         <StrandedForm
+          userId={userId}
+          profile={profile}
           onCreated={(id) => {
             setMyJobId(id);
             setView("stranded-status");
@@ -676,8 +775,9 @@ export default function App() {
 
       {view === "ops-board" && (
         <OpsBoard
-          operator={operator}
-          myJobId={opsJobId}
+          userId={userId}
+          profile={profile}
+          onProfileUpdate={refreshProfile}
           onAccept={(id) => {
             setOpsJobId(id);
             setView("ops-job");
