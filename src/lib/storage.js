@@ -69,6 +69,8 @@ export async function createJob(userId, job) {
       equipment: job.equipment,
       notes: job.notes,
       coords_label: job.coords,
+      lat: job.lat,
+      lng: job.lng,
       distance: job.distance,
       payout: job.payout,
       status: "open",

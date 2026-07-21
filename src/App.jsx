@@ -4,7 +4,9 @@ import {
   subscribeToJob, subscribeToJobsBoard,
 } from "./lib/storage.js";
 import { onAuthStateChange, getProfile, updateProfile, signOut } from "./lib/auth.js";
+import { getCurrentLocation, formatCoordLabel } from "./lib/geo.js";
 import AuthGate from "./components/AuthGate.jsx";
+import JobsMap from "./components/JobsMap.jsx";
 import {
   MapPin, Truck, LifeBuoy, Battery, Droplets, Mountain, Radio, Compass,
   Star, Phone, MessageCircle, CheckCircle2, Clock, Fuel, Wind,
@@ -48,12 +50,6 @@ function sit(id) {
 function veh(id) {
   return VEHICLE_TYPES.find((v) => v.id === id);
 }
-function randCoord() {
-  const lat = (40.55 + Math.random() * 0.06).toFixed(4);
-  const lng = (111.6 + Math.random() * 0.06).toFixed(4);
-  return `${lat} N, ${lng} W`;
-}
-
 // ---------- small UI atoms ----------
 
 function Coord({ children }) {
@@ -177,13 +173,16 @@ function StatusTracker({ status }) {
 
 // ---------- Landing ----------
 
-function Landing({ onStranded, onOps }) {
+function Landing({ onStranded, onOps, onViewMap }) {
   return (
     <div className="relative">
       <div className="relative max-w-5xl mx-auto px-6 pt-20 pb-16 text-center">
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-gray-700 bg-gray-900 text-gray-500 text-xs font-medium mb-6">
-          <Radio className="w-3.5 h-3.5 text-orange-600" /> live demo &middot; shared board
-        </div>
+        <button
+          onClick={onViewMap}
+          className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-gray-700 bg-gray-900 text-gray-500 hover:text-orange-400 hover:border-orange-800 text-xs font-medium mb-6 transition"
+        >
+          <Radio className="w-3.5 h-3.5 text-orange-600" /> LIVE MAP
+        </button>
         <h1 className="text-4xl md:text-5xl font-bold text-gray-50 tracking-tight leading-tight">
           Stuck on the trail? Or just ran out of gas?<br />Get pulled out by someone nearby.
         </h1>
@@ -220,13 +219,15 @@ function Landing({ onStranded, onOps }) {
 
 // ---------- Stranded: form + status ----------
 
-function StrandedForm({ userId, profile, onCreated, onCancel }) {
+function StrandedForm({ userId, profile, onCreated, onCancel, onNeedAuth }) {
   const [vehicle, setVehicle] = useState(null);
   const [situation, setSituation] = useState(null);
   const [equipment, setEquipment] = useState([]);
   const [notes, setNotes] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [locating, setLocating] = useState(false);
+  const [locationApprox, setLocationApprox] = useState(false);
 
   function toggleEquip(item) {
     setEquipment((e) => (e.includes(item) ? e.filter((x) => x !== item) : [...e, item]));
@@ -234,16 +235,26 @@ function StrandedForm({ userId, profile, onCreated, onCancel }) {
 
   async function submit() {
     if (!vehicle || !situation) return;
+    if (!userId) {
+      onNeedAuth("Sign in to broadcast your request.");
+      return;
+    }
     setSubmitting(true);
+    setLocating(true);
     setError("");
     const s = sit(situation);
     try {
+      const loc = await getCurrentLocation();
+      setLocationApprox(loc.approx);
+      setLocating(false);
       const job = await createJob(userId, {
         vehicle,
         situation,
         equipment,
         notes: notes.trim(),
-        coords: randCoord(), // placeholder until real geolocation is wired in
+        lat: loc.lat,
+        lng: loc.lng,
+        coords: formatCoordLabel(loc.lat, loc.lng),
         distance: +(2 + Math.random() * 6).toFixed(1),
         payout: s.payout,
       });
@@ -252,6 +263,7 @@ function StrandedForm({ userId, profile, onCreated, onCancel }) {
       setError(err.message || "Couldn't post that request. Try again.");
     } finally {
       setSubmitting(false);
+      setLocating(false);
     }
   }
 
@@ -264,8 +276,12 @@ function StrandedForm({ userId, profile, onCreated, onCancel }) {
       </button>
       <h2 className="text-gray-50 font-semibold text-xl mb-1">Report your situation</h2>
       <p className="text-gray-400 text-sm mb-6">
-        Posting as <span className="text-gray-200">{profile?.display_name}</span> — this goes to the live board,
-        any online recovery unit can see and accept it.
+        {profile ? (
+          <>Posting as <span className="text-gray-200">{profile.display_name}</span> — this goes to the live board,
+          any online recovery unit can see and accept it.</>
+        ) : (
+          "Fill this out, then sign in to broadcast it to the live board."
+        )}
       </p>
 
       <div className="space-y-6">
@@ -337,9 +353,12 @@ function StrandedForm({ userId, profile, onCreated, onCancel }) {
         </div>
 
         {error && <p className="text-orange-400 text-xs">{error}</p>}
+        {locationApprox && !submitting && (
+          <p className="text-gray-500 text-xs">Using an approximate location — location access wasn't available.</p>
+        )}
 
         <Button tone="orange" disabled={!canSubmit || submitting} onClick={submit} className="w-full">
-          {submitting ? "POSTING..." : "BROADCAST REQUEST"}
+          {locating ? "GETTING YOUR LOCATION..." : submitting ? "POSTING..." : "BROADCAST REQUEST"}
         </Button>
       </div>
     </div>
@@ -429,12 +448,14 @@ function StrandedStatus({ jobId, onDone, onCancel }) {
 
 // ---------- Ops: board + job ----------
 
-function OpsBoard({ userId, profile, onProfileUpdate, onAccept }) {
+function OpsBoard({ userId, profile, onProfileUpdate, onAccept, onNeedAuth }) {
   const [jobs, setJobs] = useState([]);
   const [online, setOnline] = useState(true);
   const [rigInput, setRigInput] = useState("");
   const [savingRig, setSavingRig] = useState(false);
   const [acceptError, setAcceptError] = useState("");
+  const [showMap, setShowMap] = useState(false);
+  const [selfLocation, setSelfLocation] = useState(null);
 
   const refresh = useCallback(async () => {
     const all = await loadAllJobs();
@@ -447,10 +468,21 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept }) {
     return unsubscribe;
   }, [refresh]);
 
+  // only ask for location once the operator actually opens the map view
+  useEffect(() => {
+    if (showMap && !selfLocation) {
+      getCurrentLocation().then(setSelfLocation);
+    }
+  }, [showMap, selfLocation]);
+
   const open = jobs.filter((j) => j.status === "open");
-  const mine = jobs.filter((j) => j.assignedOperatorId === userId && j.status !== "complete");
+  const mine = userId ? jobs.filter((j) => j.assignedOperatorId === userId && j.status !== "complete") : [];
 
   async function saveRig() {
+    if (!userId) {
+      onNeedAuth("Sign in to set up your recovery unit.");
+      return;
+    }
     if (!rigInput.trim()) return;
     setSavingRig(true);
     try {
@@ -462,6 +494,10 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept }) {
   }
 
   async function accept(job) {
+    if (!userId) {
+      onNeedAuth("Sign in to accept this job.");
+      return;
+    }
     setAcceptError("");
     try {
       await acceptJob(job.id, userId);
@@ -475,8 +511,8 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept }) {
     }
   }
 
-  // no rig on file yet — treat this as "not set up as an operator"
-  if (!profile?.rig) {
+  // signed in but no rig on file yet — treat this as "not set up as an operator"
+  if (userId && !profile?.rig) {
     return (
       <div className="max-w-lg mx-auto px-6 py-10">
         <h2 className="text-gray-50 font-semibold text-xl mb-1">Set up your recovery unit</h2>
@@ -504,17 +540,39 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept }) {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h2 className="text-gray-50 font-semibold text-xl">Recovery board</h2>
-          <p className="text-gray-400 text-sm">Signed in as <span className="text-gray-200">{profile.display_name}</span> &middot; {profile.rig}</p>
+          {profile ? (
+            <p className="text-gray-400 text-sm">Signed in as <span className="text-gray-200">{profile.display_name}</span> &middot; {profile.rig}</p>
+          ) : (
+            <p className="text-gray-400 text-sm">Browsing as a guest — sign in to accept jobs.</p>
+          )}
         </div>
-        <button
-          onClick={() => setOnline((o) => !o)}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border shrink-0 ${online ? "bg-emerald-950 border-emerald-600 text-emerald-400" : "bg-gray-700 border-gray-600 text-gray-500"}`}
-        >
-          <Power className="w-3.5 h-3.5" /> {online ? "Online" : "Offline"}
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          <div className="flex bg-gray-800 border border-gray-700 rounded-full p-1">
+            <button
+              onClick={() => setShowMap(false)}
+              className={`px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 ${!showMap ? "bg-gray-600 text-white" : "text-gray-400"}`}
+            >
+              List
+            </button>
+            <button
+              onClick={() => setShowMap(true)}
+              className={`px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 ${showMap ? "bg-gray-600 text-white" : "text-gray-400"}`}
+            >
+              <MapPin className="w-3.5 h-3.5" /> Map
+            </button>
+          </div>
+          {userId && (
+            <button
+              onClick={() => setOnline((o) => !o)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border ${online ? "bg-emerald-950 border-emerald-600 text-emerald-400" : "bg-gray-700 border-gray-600 text-gray-500"}`}
+            >
+              <Power className="w-3.5 h-3.5" /> {online ? "Online" : "Offline"}
+            </button>
+          )}
+        </div>
       </div>
 
-      {!profile.is_verified && (
+      {userId && !profile?.is_verified && (
         <div className="bg-orange-950 border border-orange-800 rounded-xl p-4 mb-6 flex items-start gap-3">
           <ShieldCheck className="w-4 h-4 text-orange-400 mt-0.5 shrink-0" />
           <p className="text-orange-400 text-sm">
@@ -554,6 +612,17 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept }) {
           <Compass className="w-8 h-8 text-gray-500" />
           <p className="text-gray-400 text-sm">You're offline. Go online to see nearby requests.</p>
         </div>
+      ) : showMap ? (
+        <div>
+          <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">{open.length} open request{open.length === 1 ? "" : "s"} &middot; live map</p>
+          <JobsMap
+            jobs={open.map((j) => ({ ...j, situationLabel: sit(j.situation)?.label, vehicleLabel: veh(j.vehicle)?.label }))}
+            selfLocation={selfLocation}
+            selfLabel={profile?.display_name || "You"}
+            onAccept={accept}
+            acceptDisabled={userId ? !profile?.is_verified : false}
+          />
+        </div>
       ) : (
         <div>
           <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">{open.length} open request{open.length === 1 ? "" : "s"}</p>
@@ -590,7 +659,7 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept }) {
                     tone="emerald"
                     size="sm"
                     onClick={() => accept(j)}
-                    disabled={!profile.is_verified}
+                    disabled={userId ? !profile?.is_verified : false}
                     className="w-full mt-1"
                   >
                     Accept job
@@ -674,14 +743,84 @@ function OpsJob({ jobId, onExit }) {
   );
 }
 
+// ---------- public live map ----------
+
+function LiveMapView({ userId, profile, onNeedAuth, onAccept, onBack }) {
+  const [jobs, setJobs] = useState([]);
+  const [selfLocation, setSelfLocation] = useState(null);
+  const [acceptError, setAcceptError] = useState("");
+
+  const refresh = useCallback(async () => {
+    const all = await loadAllJobs();
+    setJobs(all);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const unsubscribe = subscribeToJobsBoard(refresh);
+    return unsubscribe;
+  }, [refresh]);
+
+  useEffect(() => {
+    getCurrentLocation().then(setSelfLocation);
+  }, []);
+
+  const open = jobs.filter((j) => j.status === "open");
+
+  async function accept(job) {
+    if (!userId) {
+      onNeedAuth("Sign in to accept this job.");
+      return;
+    }
+    setAcceptError("");
+    try {
+      await acceptJob(job.id, userId);
+      onAccept(job.id);
+    } catch (err) {
+      setAcceptError(
+        err.message?.includes("row-level security") || err.code === "42501"
+          ? "Your account isn't verified as a recovery operator yet — set up your rig from the Recovery Unit tab."
+          : err.message || "Couldn't accept that job — someone may have just taken it."
+      );
+    }
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto px-6 py-10">
+      <button onClick={onBack} className="text-gray-400 text-xs mb-6 flex items-center gap-1">
+        <ChevronRight className="w-3.5 h-3.5 rotate-180" /> Back
+      </button>
+      <h2 className="text-gray-50 font-semibold text-xl mb-1">Live board</h2>
+      <p className="text-gray-400 text-sm mb-6">
+        {open.length} open request{open.length === 1 ? "" : "s"} right now &middot; updates live
+      </p>
+
+      {acceptError && (
+        <div className="bg-orange-950 border border-orange-800 rounded-xl p-3 mb-6">
+          <p className="text-orange-400 text-sm">{acceptError}</p>
+        </div>
+      )}
+
+      <JobsMap
+        jobs={open.map((j) => ({ ...j, situationLabel: sit(j.situation)?.label, vehicleLabel: veh(j.vehicle)?.label }))}
+        selfLocation={selfLocation}
+        selfLabel={profile?.display_name || "You"}
+        onAccept={accept}
+        acceptDisabled={userId ? !profile?.is_verified : false}
+      />
+    </div>
+  );
+}
+
 // ---------- app shell ----------
 
 export default function App() {
   const [session, setSession] = useState(undefined); // undefined = still checking, null = signed out
   const [profile, setProfile] = useState(null);
-  const [view, setView] = useState("landing"); // landing | stranded-form | stranded-status | ops-board | ops-job
+  const [view, setView] = useState("landing"); // landing | stranded-form | stranded-status | ops-board | ops-job | map
   const [myJobId, setMyJobId] = useState(null);
   const [opsJobId, setOpsJobId] = useState(null);
+  const [authPrompt, setAuthPrompt] = useState(null); // null | { mode, message }
 
   useEffect(() => {
     const unsubscribe = onAuthStateChange((s) => setSession(s));
@@ -697,32 +836,36 @@ export default function App() {
     else setProfile(null);
   }, [session, refreshProfile]);
 
+  // once a sign-in/sign-up succeeds, dismiss whatever prompted it
+  useEffect(() => {
+    if (session) setAuthPrompt(null);
+  }, [session]);
+
+  function needAuth(message) {
+    setAuthPrompt({ mode: "signup", message });
+  }
+
   if (session === undefined) {
     return <div className="min-h-screen bg-gray-950 flex items-center justify-center text-gray-500 text-sm">Loading...</div>;
   }
 
-  if (!session) {
-    return <AuthGate />;
-  }
-
-  if (!profile) {
+  if (session && !profile) {
     return <div className="min-h-screen bg-gray-950 flex items-center justify-center text-gray-500 text-sm">Setting up your account...</div>;
   }
 
-  const showNav = view !== "landing";
-  const userId = session.user.id;
+  const userId = session?.user?.id ?? null;
 
   return (
     <div className="min-h-screen bg-gray-950 relative">
       <TopoBackdrop />
       <div className="relative z-10">
-      {showNav && (
-        <div className="border-b border-gray-700 sticky top-0 bg-gray-950/95 backdrop-blur z-10">
-          <div className="max-w-5xl mx-auto px-6 py-3 flex items-center justify-between">
-            <button onClick={() => setView("landing")} className="flex items-center gap-2 text-gray-200 font-semibold text-sm">
-              <Zap className="w-4 h-4 text-orange-600" /> TUG
-            </button>
-            <div className="flex items-center gap-3">
+      <div className="border-b border-gray-700 sticky top-0 bg-gray-950/95 backdrop-blur z-10">
+        <div className="max-w-5xl mx-auto px-6 py-3 flex items-center justify-between">
+          <button onClick={() => setView("landing")} className="flex items-center gap-2 text-gray-200 font-semibold text-sm">
+            <Zap className="w-4 h-4 text-orange-600" /> TUG
+          </button>
+          <div className="flex items-center gap-3">
+            {view !== "landing" && (
               <div className="flex bg-gray-800 border border-gray-700 rounded-full p-1">
                 <button
                   onClick={() => setView(myJobId ? "stranded-status" : "stranded-form")}
@@ -737,20 +880,54 @@ export default function App() {
                   <Truck className="w-3.5 h-3.5" /> RECOVERY UNIT
                 </button>
               </div>
+            )}
+            {session ? (
               <button onClick={() => signOut()} className="text-gray-500 hover:text-gray-300" aria-label="Sign out">
                 <LogOut className="w-4 h-4" />
               </button>
-            </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setAuthPrompt({ mode: "signin" })}
+                  className="text-gray-300 hover:text-gray-100 text-xs font-semibold px-3 py-1.5"
+                >
+                  SIGN IN
+                </button>
+                <Button tone="orange" size="sm" onClick={() => setAuthPrompt({ mode: "signup" })}>
+                  SIGN UP
+                </Button>
+              </div>
+            )}
           </div>
         </div>
+      </div>
+
+      {view === "landing" && (
+        <Landing
+          onStranded={() => setView("stranded-form")}
+          onOps={() => setView("ops-board")}
+          onViewMap={() => setView("map")}
+        />
       )}
 
-      {view === "landing" && <Landing onStranded={() => setView("stranded-form")} onOps={() => setView("ops-board")} />}
+      {view === "map" && (
+        <LiveMapView
+          userId={userId}
+          profile={profile}
+          onNeedAuth={needAuth}
+          onBack={() => setView("landing")}
+          onAccept={(id) => {
+            setOpsJobId(id);
+            setView("ops-job");
+          }}
+        />
+      )}
 
       {view === "stranded-form" && (
         <StrandedForm
           userId={userId}
           profile={profile}
+          onNeedAuth={needAuth}
           onCreated={(id) => {
             setMyJobId(id);
             setView("stranded-status");
@@ -778,6 +955,7 @@ export default function App() {
           userId={userId}
           profile={profile}
           onProfileUpdate={refreshProfile}
+          onNeedAuth={needAuth}
           onAccept={(id) => {
             setOpsJobId(id);
             setView("ops-job");
@@ -787,6 +965,14 @@ export default function App() {
 
       {view === "ops-job" && opsJobId && <OpsJob jobId={opsJobId} onExit={() => setView("ops-board")} />}
       </div>
+
+      {authPrompt && (
+        <AuthGate
+          initialMode={authPrompt.mode}
+          message={authPrompt.message}
+          onClose={() => setAuthPrompt(null)}
+        />
+      )}
     </div>
   );
 }

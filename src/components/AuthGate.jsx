@@ -1,9 +1,9 @@
 import React, { useState } from "react";
-import { LifeBuoy } from "lucide-react";
+import { LifeBuoy, X } from "lucide-react";
 import { signIn, signUp } from "../lib/auth.js";
 
-export default function AuthGate() {
-  const [mode, setMode] = useState("signin"); // signin | signup
+export default function AuthGate({ initialMode = "signin", message, onClose }) {
+  const [mode, setMode] = useState(initialMode); // signin | signup
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
@@ -32,11 +32,23 @@ export default function AuthGate() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-950 flex items-center justify-center px-6">
-      <div className="w-full max-w-sm">
-        <div className="flex items-center gap-2 text-gray-100 font-semibold text-lg mb-8 justify-center">
-          <LifeBuoy className="w-5 h-5 text-orange-500" /> TUG
+    <div
+      className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center px-6"
+      onClick={onClose}
+    >
+      <div className="w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-2 text-gray-100 font-semibold text-lg">
+            <LifeBuoy className="w-5 h-5 text-orange-500" /> TUG
+          </div>
+          {onClose && (
+            <button onClick={onClose} className="text-gray-500 hover:text-gray-300" aria-label="Close">
+              <X className="w-4 h-4" />
+            </button>
+          )}
         </div>
+
+        {message && <p className="text-gray-400 text-xs mb-4 -mt-2">{message}</p>}
 
         <div className="bg-gray-800 border border-gray-700 rounded-xl p-6">
           <div className="flex bg-gray-700 rounded-full p-1 mb-6">

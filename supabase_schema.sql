@@ -26,16 +26,19 @@ alter table profiles enable row level security;
 -- can see the name/rig of the operator assigned to their job, and vice
 -- versa). No sensitive data lives here, so this is intentionally open.
 -- Revisit if you add fields like phone/email/address to this table.
+drop policy if exists "profiles_select_authenticated" on profiles;
 create policy "profiles_select_authenticated"
   on profiles for select
   to authenticated
   using (true);
 
+drop policy if exists "profiles_insert_own" on profiles;
 create policy "profiles_insert_own"
   on profiles for insert
   to authenticated
   with check (id = auth.uid());
 
+drop policy if exists "profiles_update_own" on profiles;
 create policy "profiles_update_own"
   on profiles for update
   to authenticated
@@ -108,6 +111,7 @@ alter table jobs enable row level security;
 
 -- SELECT: open jobs are visible to everyone (that's the public board);
 -- a job is also always visible to its own requester and its assigned operator.
+drop policy if exists "jobs_select" on jobs;
 create policy "jobs_select"
   on jobs for select
   to authenticated
@@ -118,12 +122,14 @@ create policy "jobs_select"
   );
 
 -- INSERT: you can only ever create a job as yourself, starting as 'open'.
+drop policy if exists "jobs_insert_own" on jobs;
 create policy "jobs_insert_own"
   on jobs for insert
   to authenticated
   with check (requester_id = auth.uid() and status = 'open');
 
 -- UPDATE: the requester can cancel their own job while it's still open.
+drop policy if exists "jobs_requester_cancel" on jobs;
 create policy "jobs_requester_cancel"
   on jobs for update
   to authenticated
@@ -132,6 +138,7 @@ create policy "jobs_requester_cancel"
 
 -- UPDATE: a verified operator can accept an open, unassigned job, and
 -- can advance status on any job already assigned to them.
+drop policy if exists "jobs_operator_update" on jobs;
 create policy "jobs_operator_update"
   on jobs for update
   to authenticated
@@ -164,4 +171,12 @@ create trigger jobs_set_updated_at
 -- Realtime: let the frontend subscribe to job changes instead of polling
 -- ---------------------------------------------------------------------
 
-alter publication supabase_realtime add table jobs;
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'jobs'
+  ) then
+    alter publication supabase_realtime add table jobs;
+  end if;
+end $$;
