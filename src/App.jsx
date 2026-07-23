@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
 import {
   loadJob, loadAllJobs, createJob, acceptJob, advanceJobStatus,
-  createPaymentIntent, completeJob, cancelPayment, createConnectAccount,
+  createPaymentIntent, completeJob, cancelPayment, createConnectAccount, syncConnectStatus,
   subscribeToJob, subscribeToJobsBoard,
 } from "./lib/storage.js";
 import { onAuthStateChange, getProfile, updateProfile, signOut } from "./lib/auth.js";
@@ -986,6 +986,17 @@ export default function App() {
   useEffect(() => {
     if (session) setAuthPrompt(null);
   }, [session]);
+
+  // Stripe redirects operators back here after hosted Connect onboarding —
+  // re-check their payout status immediately rather than waiting on a
+  // webhook, since it needs to be right the moment they land back.
+  useEffect(() => {
+    if (!session?.user) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("connect") !== "return") return;
+    window.history.replaceState({}, "", window.location.pathname);
+    syncConnectStatus().then(refreshProfile).catch((err) => console.error("syncConnectStatus failed", err));
+  }, [session, refreshProfile]);
 
   function needAuth(message) {
     setAuthPrompt({ mode: "signup", message });

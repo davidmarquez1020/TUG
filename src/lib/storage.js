@@ -159,6 +159,13 @@ export async function createConnectAccount() {
   return callFunction("create-connect-account", {});
 }
 
+// re-checks the operator's Connect account status directly with Stripe —
+// called when they land back on the app after hosted onboarding, since
+// waiting on a webhook isn't reliable/fast enough for that moment
+export async function syncConnectStatus() {
+  return callFunction("sync-connect-status", {});
+}
+
 // ---------- realtime ----------
 // Postgres change payloads don't include our joined profile data, so on
 // any change we just signal the caller to refetch rather than trying to
