@@ -1,17 +1,20 @@
 import React, { useState, useEffect, useCallback } from "react";
+import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
 import {
-  loadJob, loadAllJobs, createJob, acceptJob, advanceJobStatus, cancelJob,
+  loadJob, loadAllJobs, createJob, acceptJob, advanceJobStatus,
+  createPaymentIntent, completeJob, cancelPayment, createConnectAccount,
   subscribeToJob, subscribeToJobsBoard,
 } from "./lib/storage.js";
 import { onAuthStateChange, getProfile, updateProfile, signOut } from "./lib/auth.js";
 import { getCurrentLocation, formatCoordLabel } from "./lib/geo.js";
+import { stripePromise } from "./lib/stripeClient.js";
 import AuthGate from "./components/AuthGate.jsx";
 import JobsMap from "./components/JobsMap.jsx";
 import {
   MapPin, Truck, LifeBuoy, Battery, Droplets, Mountain, Radio, Compass,
   Star, Phone, MessageCircle, CheckCircle2, Clock, Fuel, Wind,
   TriangleAlert, ChevronRight, Power, DollarSign, Bike, CircleDot,
-  ArrowRight, Users, ShieldCheck, Zap, Car, Wrench, LogOut
+  ArrowRight, Users, ShieldCheck, Zap, Car, Wrench, LogOut, CreditCard
 } from "lucide-react";
 
 // ---------- reference data ----------
@@ -219,6 +222,63 @@ function Landing({ onStranded, onOps, onViewMap }) {
 
 // ---------- Stranded: form + status ----------
 
+// Card entry + authorize step, shown once a payment intent has been
+// created for the chosen situation. Split into an outer Elements provider
+// (needs the clientSecret up front) and an inner form that can call the
+// useStripe/useElements hooks.
+function PaymentStep({ clientSecret, amount, onAuthorized, onBack }) {
+  return (
+    <Elements stripe={stripePromise} options={{ clientSecret, appearance: { theme: "night" } }}>
+      <PaymentStepForm amount={amount} onAuthorized={onAuthorized} onBack={onBack} />
+    </Elements>
+  );
+}
+
+function PaymentStepForm({ amount, onAuthorized, onBack }) {
+  const stripe = useStripe();
+  const elements = useElements();
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  async function pay() {
+    if (!stripe || !elements) return;
+    setSubmitting(true);
+    setError("");
+    const { error: confirmError, paymentIntent } = await stripe.confirmPayment({
+      elements,
+      redirect: "if_required",
+    });
+    if (confirmError) {
+      setError(confirmError.message || "Payment failed. Try again.");
+      setSubmitting(false);
+      return;
+    }
+    if (paymentIntent?.status === "requires_capture" || paymentIntent?.status === "succeeded") {
+      onAuthorized();
+    } else {
+      setError("Payment wasn't authorized. Try again.");
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <p className="text-gray-400 text-sm">
+        Your card is authorized for <span className="text-gray-100 font-medium">${amount}</span> now — you're
+        only actually charged once a recovery unit marks the job complete.
+      </p>
+      <PaymentElement />
+      {error && <p className="text-orange-400 text-xs">{error}</p>}
+      <div className="flex gap-2">
+        <Button tone="stone" onClick={onBack} disabled={submitting}>Back</Button>
+        <Button tone="orange" onClick={pay} disabled={!stripe || submitting} className="flex-1">
+          {submitting ? "AUTHORIZING..." : `AUTHORIZE $${amount} & BROADCAST`}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function StrandedForm({ userId, profile, onCreated, onCancel, onNeedAuth }) {
   const [vehicle, setVehicle] = useState(null);
   const [situation, setSituation] = useState(null);
@@ -226,27 +286,37 @@ function StrandedForm({ userId, profile, onCreated, onCancel, onNeedAuth }) {
   const [notes, setNotes] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
-  const [locating, setLocating] = useState(false);
-  const [locationApprox, setLocationApprox] = useState(false);
+  const [broadcasting, setBroadcasting] = useState(false);
+  const [payment, setPayment] = useState(null); // { clientSecret, paymentIntentId, amount } once authorize step is reached
 
   function toggleEquip(item) {
     setEquipment((e) => (e.includes(item) ? e.filter((x) => x !== item) : [...e, item]));
   }
 
-  async function submit() {
+  async function proceedToPayment() {
     if (!vehicle || !situation) return;
     if (!userId) {
       onNeedAuth("Sign in to broadcast your request.");
       return;
     }
     setSubmitting(true);
-    setLocating(true);
     setError("");
-    const s = sit(situation);
+    try {
+      const { clientSecret, paymentIntentId, amount } = await createPaymentIntent(situation);
+      setPayment({ clientSecret, paymentIntentId, amount });
+    } catch (err) {
+      setError(err.message || "Couldn't start payment. Try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function finishBroadcast() {
+    setBroadcasting(true);
+    setError("");
     try {
       const loc = await getCurrentLocation();
-      setLocationApprox(loc.approx);
-      setLocating(false);
+      const s = sit(situation);
       const job = await createJob(userId, {
         vehicle,
         situation,
@@ -257,17 +327,44 @@ function StrandedForm({ userId, profile, onCreated, onCancel, onNeedAuth }) {
         coords: formatCoordLabel(loc.lat, loc.lng),
         distance: +(2 + Math.random() * 6).toFixed(1),
         payout: s.payout,
+        stripePaymentIntentId: payment.paymentIntentId,
       });
       onCreated(job.id);
     } catch (err) {
-      setError(err.message || "Couldn't post that request. Try again.");
-    } finally {
-      setSubmitting(false);
-      setLocating(false);
+      setError(err.message || "Payment was authorized but the request couldn't be posted — contact support.");
+      setBroadcasting(false);
     }
   }
 
   const canSubmit = vehicle && situation;
+
+  if (payment) {
+    return (
+      <div className="max-w-lg mx-auto px-6 py-10">
+        <button onClick={() => setPayment(null)} className="text-gray-400 text-xs mb-6 flex items-center gap-1" disabled={broadcasting}>
+          <ChevronRight className="w-3.5 h-3.5 rotate-180" /> Back
+        </button>
+        <h2 className="text-gray-50 font-semibold text-xl mb-1 flex items-center gap-2">
+          <CreditCard className="w-5 h-5 text-orange-500" /> Authorize payment
+        </h2>
+        <p className="text-gray-400 text-sm mb-6">
+          {sit(situation)?.label} &middot; {veh(vehicle)?.label}
+        </p>
+
+        {broadcasting ? (
+          <p className="text-gray-400 text-sm">Broadcasting your request...</p>
+        ) : (
+          <PaymentStep
+            clientSecret={payment.clientSecret}
+            amount={payment.amount}
+            onBack={() => setPayment(null)}
+            onAuthorized={finishBroadcast}
+          />
+        )}
+        {error && <p className="text-orange-400 text-xs mt-4">{error}</p>}
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-lg mx-auto px-6 py-10">
@@ -353,12 +450,9 @@ function StrandedForm({ userId, profile, onCreated, onCancel, onNeedAuth }) {
         </div>
 
         {error && <p className="text-orange-400 text-xs">{error}</p>}
-        {locationApprox && !submitting && (
-          <p className="text-gray-500 text-xs">Using an approximate location — location access wasn't available.</p>
-        )}
 
-        <Button tone="orange" disabled={!canSubmit || submitting} onClick={submit} className="w-full">
-          {locating ? "GETTING YOUR LOCATION..." : submitting ? "POSTING..." : "BROADCAST REQUEST"}
+        <Button tone="orange" disabled={!canSubmit || submitting} onClick={proceedToPayment} className="w-full">
+          {submitting ? "STARTING PAYMENT..." : "CONTINUE TO PAYMENT"}
         </Button>
       </div>
     </div>
@@ -381,7 +475,7 @@ function StrandedStatus({ jobId, onDone, onCancel }) {
 
   async function handleCancel() {
     try {
-      await cancelJob(jobId);
+      await cancelPayment(jobId);
     } catch (err) {
       console.error(err);
     }
@@ -456,6 +550,8 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept, onNeedAuth }) {
   const [acceptError, setAcceptError] = useState("");
   const [showMap, setShowMap] = useState(false);
   const [selfLocation, setSelfLocation] = useState(null);
+  const [connecting, setConnecting] = useState(false);
+  const [connectError, setConnectError] = useState("");
 
   const refresh = useCallback(async () => {
     const all = await loadAllJobs();
@@ -505,9 +601,21 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept, onNeedAuth }) {
     } catch (err) {
       setAcceptError(
         err.message?.includes("row-level security") || err.code === "42501"
-          ? "Your account isn't verified as a recovery operator yet."
+          ? "Your account isn't fully set up to accept jobs yet — check verification and payout status above."
           : err.message || "Couldn't accept that job — someone may have just taken it."
       );
+    }
+  }
+
+  async function startConnect() {
+    setConnecting(true);
+    setConnectError("");
+    try {
+      const { url } = await createConnectAccount();
+      window.location.href = url;
+    } catch (err) {
+      setConnectError(err.message || "Couldn't start payout setup. Try again.");
+      setConnecting(false);
     }
   }
 
@@ -529,6 +637,34 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept, onNeedAuth }) {
           />
           <Button tone="emerald" onClick={saveRig} disabled={savingRig || !rigInput.trim()} className="w-full">
             {savingRig ? "SAVING..." : "SAVE AND CONTINUE"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // rig is set but Stripe payouts aren't connected yet — required before
+  // accepting jobs, since acceptance now implies being able to receive the
+  // eventual payout transfer (see the jobs_operator_update RLS policy).
+  if (userId && profile?.rig && !profile?.stripe_payouts_enabled) {
+    return (
+      <div className="max-w-lg mx-auto px-6 py-10">
+        <h2 className="text-gray-50 font-semibold text-xl mb-1">Set up payouts</h2>
+        <p className="text-gray-400 text-sm mb-6">
+          Connect a payout account so you're paid automatically as soon as you mark a job complete.
+        </p>
+        <div className="bg-gray-800 border border-gray-700 rounded-xl p-4 space-y-3">
+          <p className="text-gray-400 text-sm">
+            You'll be redirected to Stripe to verify your identity and add a bank account — takes a few minutes.
+          </p>
+          {connectError && <p className="text-orange-400 text-xs">{connectError}</p>}
+          <Button
+            tone="emerald"
+            onClick={startConnect}
+            disabled={connecting}
+            className="w-full flex items-center justify-center gap-2"
+          >
+            <CreditCard className="w-4 h-4" /> {connecting ? "REDIRECTING..." : "CONNECT PAYOUT ACCOUNT"}
           </Button>
         </div>
       </div>
@@ -677,6 +813,7 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept, onNeedAuth }) {
 function OpsJob({ jobId, onExit }) {
   const [job, setJob] = useState(null);
   const [advancing, setAdvancing] = useState(false);
+  const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
     const j = await loadJob(jobId);
@@ -694,9 +831,14 @@ function OpsJob({ jobId, onExit }) {
     const idx = STATUS_STEPS.indexOf(job.status);
     const next = STATUS_STEPS[Math.min(idx + 1, STATUS_STEPS.length - 1)];
     setAdvancing(true);
+    setError("");
     try {
-      const updated = await advanceJobStatus(job.id, next);
+      // the final transition captures payment and pays the operator out,
+      // so it goes through the server function instead of a direct update
+      const updated = next === "complete" ? await completeJob(job.id) : await advanceJobStatus(job.id, next);
       setJob(updated);
+    } catch (err) {
+      setError(err.message || "Couldn't update this job. Try again.");
     } finally {
       setAdvancing(false);
     }
@@ -730,12 +872,16 @@ function OpsJob({ jobId, onExit }) {
 
       <StatusTracker status={job.status} />
 
+      {error && <p className="text-orange-400 text-xs mt-4">{error}</p>}
+
       <div className="mt-6">
         {done ? (
           <Button tone="stone" disabled className="w-full">JOB COMPLETE</Button>
         ) : (
           <Button tone="emerald" onClick={advance} disabled={advancing} className="w-full">
-            {advancing ? "UPDATING..." : `MARK: ${nextLabel?.toUpperCase()}`}
+            {advancing
+              ? nextLabel === "Complete" ? "CAPTURING PAYMENT..." : "UPDATING..."
+              : `MARK: ${nextLabel?.toUpperCase()}`}
           </Button>
         )}
       </div>

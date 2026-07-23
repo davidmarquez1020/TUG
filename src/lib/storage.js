@@ -24,6 +24,7 @@ function mapJobRow(row) {
     distance: row.distance,
     payout: row.payout,
     status: row.status,
+    paymentStatus: row.payment_status,
     assignedOperatorId: row.assigned_operator_id,
     assignedUnit: row.assigned_operator_id
       ? { name: row.assigned?.display_name || "Recovery unit", rig: row.assigned?.rig || "" }
@@ -74,6 +75,7 @@ export async function createJob(userId, job) {
       distance: job.distance,
       payout: job.payout,
       status: "open",
+      stripe_payment_intent_id: job.stripePaymentIntentId,
     })
     .select(JOB_SELECT)
     .single();
@@ -114,12 +116,47 @@ export async function advanceJobStatus(jobId, nextStatus) {
   return mapJobRow(data);
 }
 
-export async function cancelJob(jobId) {
-  const { error } = await supabase.from("jobs").update({ status: "cancelled" }).eq("id", jobId);
-  if (error) {
-    console.error("cancelJob failed", error);
-    throw error;
-  }
+// ---------- Stripe (Netlify Functions) ----------
+// These call server-side functions that hold the Stripe secret key and the
+// Supabase service role key — neither of which can ever live in the
+// browser bundle. See netlify/functions/.
+
+async function callFunction(name, body) {
+  const { data: { session } } = await supabase.auth.getSession();
+  const res = await fetch(`/.netlify/functions/${name}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(session ? { Authorization: `Bearer ${session.access_token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `${name} failed`);
+  return data;
+}
+
+// authorizes (holds) the card for a job's payout amount before it's created
+export async function createPaymentIntent(situation) {
+  return callFunction("create-payment-intent", { situation });
+}
+
+// captures the held payment and transfers the operator's cut in one step —
+// replaces advanceJobStatus for the final transition to "complete"
+export async function completeJob(jobId) {
+  const { job } = await callFunction("complete-job", { jobId });
+  return mapJobRow(job);
+}
+
+// releases the payment hold and cancels an open (not yet accepted) job
+export async function cancelPayment(jobId) {
+  return callFunction("cancel-payment", { jobId });
+}
+
+// creates (if needed) a Stripe Express connected account for an operator
+// and returns a URL to Stripe's hosted onboarding flow
+export async function createConnectAccount() {
+  return callFunction("create-connect-account", {});
 }
 
 // ---------- realtime ----------

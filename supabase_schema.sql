@@ -45,10 +45,17 @@ create policy "profiles_update_own"
   using (id = auth.uid())
   with check (id = auth.uid());
 
+-- Stripe Connect payout tracking for operators — written only by the
+-- Netlify Functions (service role), never directly by the client. See the
+-- column-level lock below: these two are deliberately left out of the
+-- authenticated grant.
+alter table profiles add column if not exists stripe_account_id text;
+alter table profiles add column if not exists stripe_payouts_enabled boolean not null default false;
+
 -- Column-level lock: users can update their own display_name/rig/role,
--- but cannot flip is_verified on themselves — that must be set by an
--- admin (via the Supabase dashboard, or a service-role script/edge
--- function you control), never from the client.
+-- but cannot flip is_verified (or the Stripe columns above) on
+-- themselves — those must be set by an admin or a service-role
+-- function you control, never from the client.
 revoke update on profiles from authenticated;
 grant update (display_name, rig, role) on profiles to authenticated;
 
@@ -107,6 +114,15 @@ create index if not exists jobs_status_idx on jobs (status);
 create index if not exists jobs_requester_idx on jobs (requester_id);
 create index if not exists jobs_operator_idx on jobs (assigned_operator_id);
 
+-- Stripe payment tracking. stripe_payment_intent_id is set once by the
+-- client at job-creation time (it's just relaying an id it got back from
+-- our own create-payment-intent function) — payment_status and
+-- stripe_transfer_id are written only by the Netlify Functions afterward.
+alter table jobs add column if not exists stripe_payment_intent_id text;
+alter table jobs add column if not exists stripe_transfer_id text;
+alter table jobs add column if not exists payment_status text not null default 'pending'
+  check (payment_status in ('pending', 'authorized', 'captured', 'canceled', 'failed'));
+
 alter table jobs enable row level security;
 
 -- SELECT: open jobs are visible to everyone (that's the public board);
@@ -120,6 +136,15 @@ create policy "jobs_select"
     or requester_id = auth.uid()
     or assigned_operator_id = auth.uid()
   );
+
+-- signed-out visitors (the public live map / board) can only ever see
+-- open, unclaimed jobs — never anything tied to a specific requester
+-- or operator, since a guest has no identity to match against.
+drop policy if exists "jobs_select_anon" on jobs;
+create policy "jobs_select_anon"
+  on jobs for select
+  to anon
+  using (status = 'open');
 
 -- INSERT: you can only ever create a job as yourself, starting as 'open'.
 drop policy if exists "jobs_insert_own" on jobs;
@@ -137,7 +162,9 @@ create policy "jobs_requester_cancel"
   with check (requester_id = auth.uid() and status in ('open', 'cancelled'));
 
 -- UPDATE: a verified operator can accept an open, unassigned job, and
--- can advance status on any job already assigned to them.
+-- can advance status on any job already assigned to them. Also requires
+-- completed Stripe Connect onboarding, since accepting a job now implies
+-- they're able to actually receive the eventual payout transfer.
 drop policy if exists "jobs_operator_update" on jobs;
 create policy "jobs_operator_update"
   on jobs for update
@@ -150,9 +177,24 @@ create policy "jobs_operator_update"
     assigned_operator_id = auth.uid()
     and exists (
       select 1 from profiles p
-      where p.id = auth.uid() and p.is_verified = true
+      where p.id = auth.uid() and p.is_verified = true and p.stripe_payouts_enabled = true
     )
   );
+
+-- Column-level lock on jobs: clients can insert the fields the app's
+-- StrandedForm actually sets (including stripe_payment_intent_id, which
+-- is just relayed from our own create-payment-intent function) and can
+-- update status/assigned_operator_id (accept/advance/cancel) — but never
+-- payment_status or stripe_transfer_id directly. Those two, along with
+-- the final "complete" transition, are only ever written by the
+-- service-role Netlify Functions in netlify/functions/, which bypass
+-- these grants entirely.
+revoke insert, update on jobs from authenticated;
+grant insert (
+  requester_id, vehicle, situation, equipment, notes,
+  lat, lng, coords_label, distance, payout, status, stripe_payment_intent_id
+) on jobs to authenticated;
+grant update (status, assigned_operator_id) on jobs to authenticated;
 
 create or replace function set_updated_at()
 returns trigger language plpgsql as $$
