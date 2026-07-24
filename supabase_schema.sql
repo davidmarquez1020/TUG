@@ -104,7 +104,7 @@ create table if not exists jobs (
   payout numeric not null,
 
   status text not null default 'open'
-    check (status in ('open', 'accepted', 'en_route', 'on_scene', 'recovering', 'complete', 'cancelled')),
+    check (status in ('open', 'accepted', 'en_route', 'on_scene', 'recovering', 'awaiting_confirmation', 'complete', 'cancelled')),
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -122,6 +122,22 @@ alter table jobs add column if not exists stripe_payment_intent_id text;
 alter table jobs add column if not exists stripe_transfer_id text;
 alter table jobs add column if not exists payment_status text not null default 'pending'
   check (payment_status in ('pending', 'authorized', 'captured', 'canceled', 'failed'));
+
+-- Live operator location while a job is active — the requester's own
+-- location (lat/lng above) is fixed at broadcast time, but the operator's
+-- position updates periodically en route so both sides can see a live map.
+alter table jobs add column if not exists operator_lat numeric(9, 6);
+alter table jobs add column if not exists operator_lng numeric(9, 6);
+
+-- Two-step completion: the operator marking the job done only moves it to
+-- "awaiting_confirmation" — payment isn't captured until the requester
+-- separately confirms via complete-job. Widens the status check constraint
+-- for tables that already existed before this status was added.
+alter table jobs add column if not exists operator_completed_at timestamptz;
+alter table jobs add column if not exists requester_completed_at timestamptz;
+alter table jobs drop constraint if exists jobs_status_check;
+alter table jobs add constraint jobs_status_check
+  check (status in ('open', 'accepted', 'en_route', 'on_scene', 'recovering', 'awaiting_confirmation', 'complete', 'cancelled'));
 
 alter table jobs enable row level security;
 
@@ -184,17 +200,17 @@ create policy "jobs_operator_update"
 -- Column-level lock on jobs: clients can insert the fields the app's
 -- StrandedForm actually sets (including stripe_payment_intent_id, which
 -- is just relayed from our own create-payment-intent function) and can
--- update status/assigned_operator_id (accept/advance/cancel) — but never
--- payment_status or stripe_transfer_id directly. Those two, along with
--- the final "complete" transition, are only ever written by the
--- service-role Netlify Functions in netlify/functions/, which bypass
--- these grants entirely.
+-- update status/assigned_operator_id (accept/advance/cancel) plus their
+-- own live location once assigned — but never payment_status or
+-- stripe_transfer_id directly. Those two, along with the final "complete"
+-- transition, are only ever written by the service-role Netlify Functions
+-- in netlify/functions/, which bypass these grants entirely.
 revoke insert, update on jobs from authenticated;
 grant insert (
   requester_id, vehicle, situation, equipment, notes,
   lat, lng, coords_label, distance, payout, status, stripe_payment_intent_id
 ) on jobs to authenticated;
-grant update (status, assigned_operator_id) on jobs to authenticated;
+grant update (status, assigned_operator_id, operator_lat, operator_lng) on jobs to authenticated;
 
 create or replace function set_updated_at()
 returns trigger language plpgsql as $$

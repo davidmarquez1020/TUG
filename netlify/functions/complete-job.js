@@ -1,9 +1,12 @@
 import { stripe, PLATFORM_FEE_PCT } from "./_shared/stripeClient.js";
 import { getCallerUserId, supabaseAdmin, json } from "./_shared/supabaseAdmin.js";
 
-// Captures the held payment and pays the operator (minus the platform fee)
-// in one server-side step, so a job can never end up "complete" without
-// payment actually having moved.
+// Requester's half of the two-step completion flow. Only fires once the
+// operator has already moved the job to "awaiting_confirmation" via
+// request-completion.js — this captures the held payment and pays the
+// operator out (minus the platform fee) in one server-side step, so a job
+// can never end up "complete" without payment actually having moved, and
+// never without the requester independently confirming the work was done.
 export default async (req) => {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
@@ -15,21 +18,24 @@ export default async (req) => {
 
   const { data: job, error: jobError } = await supabaseAdmin
     .from("jobs")
-    .select("id, status, payout, assigned_operator_id, stripe_payment_intent_id")
+    .select("id, status, requester_id, assigned_operator_id, stripe_payment_intent_id")
     .eq("id", jobId)
     .single();
   if (jobError || !job) return json({ error: "Job not found." }, 404);
-  if (job.assigned_operator_id !== userId) return json({ error: "You aren't assigned to this job." }, 403);
+  if (job.requester_id !== userId) return json({ error: "This isn't your request." }, 403);
   if (job.status === "complete") return json({ error: "Job is already complete." }, 400);
+  if (job.status !== "awaiting_confirmation") {
+    return json({ error: "Waiting on the recovery unit to mark this job done first." }, 400);
+  }
   if (!job.stripe_payment_intent_id) return json({ error: "No payment on file for this job." }, 400);
 
   const { data: operator, error: opError } = await supabaseAdmin
     .from("profiles")
     .select("stripe_account_id, stripe_payouts_enabled")
-    .eq("id", userId)
+    .eq("id", job.assigned_operator_id)
     .single();
   if (opError || !operator?.stripe_account_id || !operator.stripe_payouts_enabled) {
-    return json({ error: "Set up payouts before completing jobs." }, 400);
+    return json({ error: "The recovery unit hasn't finished payout setup — contact support." }, 400);
   }
 
   const captured = await stripe.paymentIntents.capture(job.stripe_payment_intent_id);
@@ -48,7 +54,12 @@ export default async (req) => {
 
   const { data: updated, error: updateError } = await supabaseAdmin
     .from("jobs")
-    .update({ status: "complete", payment_status: "captured", stripe_transfer_id: transfer.id })
+    .update({
+      status: "complete",
+      payment_status: "captured",
+      stripe_transfer_id: transfer.id,
+      requester_completed_at: new Date().toISOString(),
+    })
     .eq("id", jobId)
     .select()
     .single();

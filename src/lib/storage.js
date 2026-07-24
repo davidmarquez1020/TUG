@@ -21,6 +21,8 @@ function mapJobRow(row) {
     coords: row.coords_label,
     lat: row.lat,
     lng: row.lng,
+    operatorLat: row.operator_lat,
+    operatorLng: row.operator_lng,
     distance: row.distance,
     payout: row.payout,
     status: row.status,
@@ -116,6 +118,17 @@ export async function advanceJobStatus(jobId, nextStatus) {
   return mapJobRow(data);
 }
 
+// pings the operator's current position while a job is active — throttled
+// client-side by the caller, not fire-and-throw since this runs silently
+// in the background off a geolocation watch
+export async function updateOperatorLocation(jobId, lat, lng) {
+  const { error } = await supabase
+    .from("jobs")
+    .update({ operator_lat: lat, operator_lng: lng })
+    .eq("id", jobId);
+  if (error) console.error("updateOperatorLocation failed", error);
+}
+
 // ---------- Stripe (Netlify Functions) ----------
 // These call server-side functions that hold the Stripe secret key and the
 // Supabase service role key — neither of which can ever live in the
@@ -141,8 +154,16 @@ export async function createPaymentIntent(situation) {
   return callFunction("create-payment-intent", { situation });
 }
 
-// captures the held payment and transfers the operator's cut in one step —
-// replaces advanceJobStatus for the final transition to "complete"
+// operator's half of the two-step completion flow — moves the job to
+// "awaiting_confirmation", no payment action yet
+export async function requestCompletion(jobId) {
+  const { job } = await callFunction("request-completion", { jobId });
+  return mapJobRow(job);
+}
+
+// requester's half — captures the held payment and transfers the
+// operator's cut in one step, only once they confirm after the operator
+// has already requested completion
 export async function completeJob(jobId) {
   const { job } = await callFunction("complete-job", { jobId });
   return mapJobRow(job);

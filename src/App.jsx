@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
 import {
-  loadJob, loadAllJobs, createJob, acceptJob, advanceJobStatus,
-  createPaymentIntent, completeJob, cancelPayment, createConnectAccount, syncConnectStatus,
+  loadJob, loadAllJobs, createJob, acceptJob, advanceJobStatus, updateOperatorLocation,
+  createPaymentIntent, requestCompletion, completeJob, cancelPayment, createConnectAccount, syncConnectStatus,
   subscribeToJob, subscribeToJobsBoard,
 } from "./lib/storage.js";
 import { onAuthStateChange, getProfile, updateProfile, signOut } from "./lib/auth.js";
@@ -10,11 +10,12 @@ import { getCurrentLocation, formatCoordLabel } from "./lib/geo.js";
 import { stripePromise } from "./lib/stripeClient.js";
 import AuthGate from "./components/AuthGate.jsx";
 import JobsMap from "./components/JobsMap.jsx";
+import RouteMap from "./components/RouteMap.jsx";
 import {
   MapPin, Truck, LifeBuoy, Battery, Droplets, Mountain, Radio, Compass,
   Star, Phone, MessageCircle, CheckCircle2, Clock, Fuel, Wind,
   TriangleAlert, ChevronRight, Power, DollarSign, Bike, CircleDot,
-  ArrowRight, Users, ShieldCheck, Zap, Car, Wrench, LogOut, CreditCard
+  ArrowRight, Users, ShieldCheck, Car, Wrench, LogOut, CreditCard
 } from "lucide-react";
 
 // ---------- reference data ----------
@@ -38,13 +39,14 @@ const SITUATIONS = [
 ];
 
 const EQUIPMENT = ["Winch", "Tow strap", "Traction boards", "Air compressor", "Jump start", "Fuel can", "Spare tire"];
-const STATUS_STEPS = ["open", "accepted", "en_route", "on_scene", "recovering", "complete"];
+const STATUS_STEPS = ["open", "accepted", "en_route", "on_scene", "recovering", "awaiting_confirmation", "complete"];
 const STATUS_LABEL = {
   open: "Waiting for a unit",
   accepted: "Accepted",
   en_route: "En route",
   on_scene: "On scene",
   recovering: "Recovering",
+  awaiting_confirmation: "Recovery complete",
   complete: "Complete",
 };
 function sit(id) {
@@ -87,64 +89,12 @@ function Button({ children, onClick, tone = "orange", disabled, className = "", 
   );
 }
 
-// generates one closed, irregular contour ring around a peak center
-function contourRing(cx, cy, baseR, seed) {
-  const N = 48;
-  const points = [];
-  for (let i = 0; i <= N; i++) {
-    const t = (i / N) * Math.PI * 2;
-    const r =
-      baseR +
-      baseR * 0.18 * Math.sin(t * 3 + seed) +
-      baseR * 0.1 * Math.sin(t * 5 + seed * 1.7) +
-      baseR * 0.06 * Math.sin(t * 2 + seed * 2.3);
-    points.push([cx + r * Math.cos(t), cy + r * Math.sin(t) * 0.72]);
-  }
-  return (
-    "M " +
-    points.map(([x, y]) => `${x.toFixed(1)} ${y.toFixed(1)}`).join(" L ") +
-    " Z"
-  );
-}
-
-// a set of nested rings sharing one center, like elevation bands around a peak
-function peakCluster(cx, cy, maxR, seed, rings = 6) {
-  const out = [];
-  for (let i = 0; i < rings; i++) {
-    const r = maxR * (0.22 + i * (0.78 / (rings - 1)));
-    out.push({ d: contourRing(cx, cy, r, seed + i * 0.15), index: i });
-  }
-  return out;
-}
-
-const TERRAIN_PEAKS = [
-  peakCluster(140, 120, 180, 0.4, 7),
-  peakCluster(640, 360, 230, 2.1, 8),
-  peakCluster(380, 540, 150, 4.7, 6),
-  peakCluster(700, 60, 110, 6.2, 5),
-];
-
 function TopoBackdrop() {
   return (
-    <svg
-      className="fixed inset-0 w-full h-full opacity-[0.15] pointer-events-none"
-      viewBox="0 0 800 600"
-      preserveAspectRatio="xMidYMid slice"
-    >
-      {TERRAIN_PEAKS.map((cluster, ci) => (
-        <g key={ci} className="text-orange-400">
-          {cluster.map(({ d, index }) => (
-            <path
-              key={index}
-              d={d}
-              stroke="currentColor"
-              strokeWidth={index % 5 === 0 ? 1.4 : 0.8}
-              fill="none"
-            />
-          ))}
-        </g>
-      ))}
-    </svg>
+    <div
+      className="fixed inset-0 w-full h-full bg-cover bg-center opacity-30 pointer-events-none"
+      style={{ backgroundImage: "url(/wallpaper-topo.png)" }}
+    />
   );
 }
 
@@ -176,10 +126,19 @@ function StatusTracker({ status }) {
 
 // ---------- Landing ----------
 
+const BANNERS = ["/banners/banner-1.png", "/banners/banner-2.png", "/banners/banner-3.png", "/banners/banner-4.png"];
+
 function Landing({ onStranded, onOps, onViewMap }) {
+  const [banner] = useState(() => BANNERS[Math.floor(Math.random() * BANNERS.length)]);
+
   return (
     <div className="relative">
-      <div className="relative max-w-5xl mx-auto px-6 pt-20 pb-16 text-center">
+      <div className="relative max-w-5xl mx-auto px-6 pt-16 pb-16 text-center">
+        <img
+          src={banner}
+          alt="TUG — vehicle recovery specialists"
+          className="w-full max-w-lg mx-auto rounded-xl border border-gray-700 mb-8"
+        />
         <button
           onClick={onViewMap}
           className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-gray-700 bg-gray-900 text-gray-500 hover:text-orange-400 hover:border-orange-800 text-xs font-medium mb-6 transition"
@@ -461,6 +420,8 @@ function StrandedForm({ userId, profile, onCreated, onCancel, onNeedAuth }) {
 
 function StrandedStatus({ jobId, onDone, onCancel }) {
   const [job, setJob] = useState(null);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmError, setConfirmError] = useState("");
 
   const refresh = useCallback(async () => {
     const j = await loadJob(jobId);
@@ -480,6 +441,19 @@ function StrandedStatus({ jobId, onDone, onCancel }) {
       console.error(err);
     }
     onCancel();
+  }
+
+  async function handleConfirm() {
+    setConfirming(true);
+    setConfirmError("");
+    try {
+      const updated = await completeJob(jobId);
+      setJob(updated);
+    } catch (err) {
+      setConfirmError(err.message || "Couldn't confirm completion. Try again.");
+    } finally {
+      setConfirming(false);
+    }
   }
 
   if (!job) {
@@ -532,6 +506,31 @@ function StrandedStatus({ jobId, onDone, onCancel }) {
             <span className="w-8 h-8 rounded-lg bg-gray-700 flex items-center justify-center"><Phone className="w-3.5 h-3.5 text-gray-200" /></span>
             <span className="w-8 h-8 rounded-lg bg-gray-700 flex items-center justify-center"><MessageCircle className="w-3.5 h-3.5 text-gray-200" /></span>
           </div>
+        </div>
+      )}
+
+      <div className="mb-6">
+        <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
+          {job.assignedUnit ? `${job.assignedUnit.name}'s route to you` : "Recovery unit's route to you"}
+        </p>
+        <RouteMap
+          strandedLocation={{ lat: job.lat, lng: job.lng }}
+          strandedLabel="You"
+          operatorLocation={job.operatorLat != null ? { lat: job.operatorLat, lng: job.operatorLng } : null}
+          operatorLabel={job.assignedUnit?.name || "Recovery unit"}
+        />
+      </div>
+
+      {job.status === "awaiting_confirmation" && (
+        <div className="bg-emerald-950 border border-emerald-800 rounded-xl p-4 mb-6">
+          <p className="text-emerald-400 text-sm mb-3">
+            {job.assignedUnit?.name || "Your recovery unit"} marked this job as complete. Confirm below to release
+            payment.
+          </p>
+          <Button tone="emerald" onClick={handleConfirm} disabled={confirming} className="w-full">
+            {confirming ? "CONFIRMING..." : "CONFIRM RECOVERY COMPLETE"}
+          </Button>
+          {confirmError && <p className="text-orange-400 text-xs mt-2">{confirmError}</p>}
         </div>
       )}
 
@@ -810,10 +809,16 @@ function OpsBoard({ userId, profile, onProfileUpdate, onAccept, onNeedAuth }) {
   );
 }
 
+// how often an operator's live position gets written to the job row —
+// their own map updates as fast as the browser reports movement, but this
+// throttles what the requester actually sees to avoid hammering the db
+const LOCATION_PING_INTERVAL_MS = 30000;
+
 function OpsJob({ jobId, onExit }) {
   const [job, setJob] = useState(null);
   const [advancing, setAdvancing] = useState(false);
   const [error, setError] = useState("");
+  const [selfLocation, setSelfLocation] = useState(null);
 
   const refresh = useCallback(async () => {
     const j = await loadJob(jobId);
@@ -826,6 +831,39 @@ function OpsJob({ jobId, onExit }) {
     return unsubscribe;
   }, [jobId, refresh]);
 
+  // live-track the operator's own position while the job is active, and
+  // periodically persist it so the requester's map stays up to date
+  useEffect(() => {
+    if (!job || job.status === "complete" || !navigator.geolocation) return;
+    let lastSent = 0;
+    let fellBack = false;
+
+    function send(lat, lng) {
+      setSelfLocation({ lat, lng });
+      const now = Date.now();
+      if (now - lastSent >= LOCATION_PING_INTERVAL_MS) {
+        lastSent = now;
+        updateOperatorLocation(job.id, lat, lng);
+      }
+    }
+
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => send(pos.coords.latitude, pos.coords.longitude),
+      (err) => {
+        console.error("watchPosition failed", err);
+        // permission denied or unavailable — fall back to an approximate
+        // demo location so the map still renders instead of hanging on
+        // "waiting for location" indefinitely
+        if (!fellBack) {
+          fellBack = true;
+          getCurrentLocation().then((loc) => send(loc.lat, loc.lng));
+        }
+      },
+      { enableHighAccuracy: true, maximumAge: 10000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [job?.id, job?.status]);
+
   async function advance() {
     if (!job) return;
     const idx = STATUS_STEPS.indexOf(job.status);
@@ -833,9 +871,11 @@ function OpsJob({ jobId, onExit }) {
     setAdvancing(true);
     setError("");
     try {
-      // the final transition captures payment and pays the operator out,
-      // so it goes through the server function instead of a direct update
-      const updated = next === "complete" ? await completeJob(job.id) : await advanceJobStatus(job.id, next);
+      // marking "recovery complete" only requests confirmation — it
+      // doesn't capture payment. That only happens once the requester
+      // separately confirms via their own button (see StrandedStatus).
+      const updated =
+        next === "awaiting_confirmation" ? await requestCompletion(job.id) : await advanceJobStatus(job.id, next);
       setJob(updated);
     } catch (err) {
       setError(err.message || "Couldn't update this job. Try again.");
@@ -870,6 +910,18 @@ function OpsJob({ jobId, onExit }) {
         </div>
       )}
 
+      {!done && (
+        <div className="mb-6">
+          <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">Route to {job.requester}</p>
+          <RouteMap
+            operatorLocation={selfLocation}
+            operatorLabel="You"
+            strandedLocation={{ lat: job.lat, lng: job.lng }}
+            strandedLabel={job.requester}
+          />
+        </div>
+      )}
+
       <StatusTracker status={job.status} />
 
       {error && <p className="text-orange-400 text-xs mt-4">{error}</p>}
@@ -877,10 +929,14 @@ function OpsJob({ jobId, onExit }) {
       <div className="mt-6">
         {done ? (
           <Button tone="stone" disabled className="w-full">JOB COMPLETE</Button>
+        ) : job.status === "awaiting_confirmation" ? (
+          <Button tone="stone" disabled className="w-full">
+            WAITING FOR {job.requester.toUpperCase()} TO CONFIRM
+          </Button>
         ) : (
           <Button tone="emerald" onClick={advance} disabled={advancing} className="w-full">
             {advancing
-              ? nextLabel === "Complete" ? "CAPTURING PAYMENT..." : "UPDATING..."
+              ? nextLabel === "Recovery complete" ? "MARKING COMPLETE..." : "UPDATING..."
               : `MARK: ${nextLabel?.toUpperCase()}`}
           </Button>
         )}
@@ -1018,8 +1074,8 @@ export default function App() {
       <div className="relative z-10">
       <div className="border-b border-gray-700 sticky top-0 bg-gray-950/95 backdrop-blur z-10">
         <div className="max-w-5xl mx-auto px-6 py-3 flex items-center justify-between">
-          <button onClick={() => setView("landing")} className="flex items-center gap-2 text-gray-200 font-semibold text-sm">
-            <Zap className="w-4 h-4 text-orange-600" /> TUG
+          <button onClick={() => setView("landing")} className="text-orange-500 font-bold text-lg tracking-tight">
+            TUG
           </button>
           <div className="flex items-center gap-3">
             {view !== "landing" && (

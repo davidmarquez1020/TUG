@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { LifeBuoy, X } from "lucide-react";
+import { X } from "lucide-react";
 import { signIn, signUp } from "../lib/auth.js";
 
 export default function AuthGate({ initialMode = "signin", message, onClose }) {
@@ -38,8 +38,8 @@ export default function AuthGate({ initialMode = "signin", message, onClose }) {
     >
       <div className="w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-6">
-          <div className="flex items-center gap-2 text-gray-100 font-semibold text-lg">
-            <LifeBuoy className="w-5 h-5 text-orange-500" /> TUG
+          <div className="text-orange-500 font-bold text-lg tracking-tight">
+            TUG
           </div>
           {onClose && (
             <button onClick={onClose} className="text-gray-500 hover:text-gray-300" aria-label="Close">
